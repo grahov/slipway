@@ -29,7 +29,10 @@ pub fn expand_home(path: &str) -> PathBuf {
     }
 }
 
-fn load_identities(secrets: &Secrets) -> Result<Vec<Identity>> {
+/// Loads the identity file: either the standard age identity format
+/// (comments + `AGE-SECRET-KEY-...` lines) or an OpenSSH private key.
+/// Passphrase-protected ssh keys are rejected — slipway never prompts.
+fn load_identities(secrets: &Secrets) -> Result<Vec<Box<dyn age::Identity>>> {
     let path = expand_home(&secrets.identity);
     let text = fs::read_to_string(&path).with_context(|| {
         format!(
@@ -37,6 +40,19 @@ fn load_identities(secrets: &Secrets) -> Result<Vec<Identity>> {
             path.display()
         )
     })?;
+    if text.contains("OPENSSH PRIVATE KEY") {
+        let name = path.display().to_string();
+        let identity =
+            age::ssh::Identity::from_buffer(std::io::Cursor::new(text.into_bytes()), Some(name))
+                .with_context(|| format!("{} is not a usable ssh key", path.display()))?;
+        if matches!(identity, age::ssh::Identity::Encrypted(_)) {
+            bail!(
+                "{} is passphrase-protected; use a key without a passphrase or an age identity",
+                path.display()
+            );
+        }
+        return Ok(vec![Box::new(identity)]);
+    }
     let identities: Vec<Identity> = text
         .lines()
         .map(str::trim)
@@ -47,18 +63,32 @@ fn load_identities(secrets: &Secrets) -> Result<Vec<Identity>> {
     if identities.is_empty() {
         bail!("{} contains no age identities", path.display());
     }
-    Ok(identities)
+    Ok(identities
+        .into_iter()
+        .map(|id| Box::new(id) as Box<dyn age::Identity>)
+        .collect())
 }
 
-fn recipients(secrets: &Secrets) -> Result<Vec<Recipient>> {
+/// An `age1...` key or an ssh public key (`ssh-ed25519 ...`, `ssh-rsa ...`).
+pub fn parse_recipient(value: &str) -> Result<Box<dyn age::Recipient + Send>> {
+    if let Ok(recipient) = value.parse::<Recipient>() {
+        return Ok(Box::new(recipient));
+    }
+    if let Ok(recipient) = value.parse::<age::ssh::Recipient>() {
+        return Ok(Box::new(recipient));
+    }
+    bail!("{value:?} is neither an age public key nor a supported ssh public key")
+}
+
+fn recipients(secrets: &Secrets) -> Result<Vec<Box<dyn age::Recipient + Send>>> {
     if secrets.recipients.is_empty() {
         bail!("secrets.recipients is empty: add the public key `slipway secrets init` printed");
     }
-    Ok(secrets
+    secrets
         .recipients
         .iter()
-        .map(|r| r.parse::<Recipient>().expect("validated at config load"))
-        .collect())
+        .map(|r| parse_recipient(r))
+        .collect()
 }
 
 pub fn decrypt(secrets: &Secrets) -> Result<String> {
@@ -68,7 +98,7 @@ pub fn decrypt(secrets: &Secrets) -> Result<String> {
     let decryptor = age::Decryptor::new(ArmoredReader::new(&ciphertext[..]))
         .with_context(|| format!("{} is not an age file", secrets.file))?;
     let mut reader = decryptor
-        .decrypt(identities.iter().map(|id| id as &dyn age::Identity))
+        .decrypt(identities.iter().map(|id| id.as_ref()))
         .with_context(|| {
             format!(
                 "cannot decrypt {} with the configured identity",
@@ -83,9 +113,10 @@ pub fn decrypt(secrets: &Secrets) -> Result<String> {
 
 fn encrypt(secrets: &Secrets, plaintext: &str) -> Result<Vec<u8>> {
     let recipients = recipients(secrets)?;
-    let encryptor =
-        age::Encryptor::with_recipients(recipients.iter().map(|r| r as &dyn age::Recipient))
-            .context("cannot build the age encryptor")?;
+    let encryptor = age::Encryptor::with_recipients(
+        recipients.iter().map(|r| r.as_ref() as &dyn age::Recipient),
+    )
+    .context("cannot build the age encryptor")?;
     let mut ciphertext = Vec::new();
     let armor = ArmoredWriter::wrap_output(&mut ciphertext, Format::AsciiArmor)?;
     let mut writer = encryptor.wrap_output(armor)?;
@@ -167,8 +198,21 @@ pub fn init(config: &Config) -> Result<()> {
     let secrets = required(config)?;
     let identity_path = expand_home(&secrets.identity);
     if identity_path.exists() {
-        let public = load_identities(secrets)?[0].to_public();
-        ui::note(&format!("identity exists; public key: {public}"));
+        load_identities(secrets)?;
+        let text = fs::read_to_string(&identity_path)?;
+        if text.contains("OPENSSH PRIVATE KEY") {
+            ui::note("identity is an ssh key; its .pub line is the recipient");
+        } else if let Some(first) = text
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty() && !line.starts_with('#'))
+        {
+            let public = first
+                .parse::<Identity>()
+                .expect("checked above")
+                .to_public();
+            ui::note(&format!("identity exists; public key: {public}"));
+        }
     } else {
         if let Some(parent) = identity_path.parent() {
             fs::create_dir_all(parent)?;

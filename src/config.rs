@@ -336,8 +336,8 @@ impl Config {
                 bail!("secrets.mode = \"encrypted-credential\" needs a system-scope service");
             }
             for recipient in &secrets.recipients {
-                if recipient.parse::<age::x25519::Recipient>().is_err() {
-                    bail!("secrets.recipients entry {recipient:?} is not an age public key");
+                if let Err(err) = crate::secrets::parse_recipient(recipient) {
+                    bail!("secrets.recipients: {err:#}");
                 }
             }
         }

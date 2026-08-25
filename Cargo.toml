@@ -10,7 +10,7 @@ keywords = ["deploy", "systemd", "ssh", "cli", "devops"]
 categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
-age = { version = "0.12", features = ["armor"] }
+age = { version = "0.12", features = ["armor", "ssh"] }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 jiff = "0.2"
