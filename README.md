@@ -30,15 +30,18 @@ systemd, it is already a deploy target.
   aliases, jump hosts, and multiplexing work as usual.
 - Remote: sshd, systemd, tar, GNU coreutils. With the default `sudo = true`
   the ssh user needs passwordless sudo for `systemctl` and for installing
-  the unit file; with `sudo = false` connect as root instead.
+  the unit file; with `sudo = false` connect as root instead — or set
+  `service.scope = "user"` and skip privileges entirely (run
+  `loginctl enable-linger` once so the service survives logout).
 
 ## Install
+
+Grab a binary from [releases](https://github.com/grahov/slipway/releases)
+(linux and macOS, x86_64 and aarch64), or build from source:
 
 ```
 cargo install --path .
 ```
-
-Binary releases are planned.
 
 ## Quick start
 
@@ -71,26 +74,32 @@ command it would execute, verbatim, without touching anything.
 | `slipway deploy` | build, upload, flip, restart, health-check every host |
 | `slipway rollback` | flip hosts back to the release preceding the current one |
 | `slipway status` | current release, service state, recent releases per host |
+| `slipway logs` | recent journal entries per host; `-f` follows one host |
+| `slipway exec -- CMD` | run a command on every host through the remote shell |
 | `slipway secrets init` | create the age identity, then the encrypted secrets file |
 | `slipway secrets edit` | decrypt into `$EDITOR`, validate, re-encrypt |
 | `slipway secrets push` | rotate secrets: upload, restart, health-check |
 
 `deploy` also takes `--dry-run` (print commands, execute nothing) and
-`--skip-build` (deploy the artifact as it is). All three commands accept
-`-c FILE` and `--host SUBSTRING` to work on part of the fleet.
+`--skip-build` (deploy the artifact as it is). Every fleet command accepts
+`-c FILE`, `--host SUBSTRING`, and `--group NAME` to work on part of the
+fleet.
 
 ## Config reference
 
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `app` | — | service and unit name; `[a-z0-9._-]` |
-| `hosts` | — | ssh destinations, passed to `ssh` verbatim |
+| `hosts` | — | ssh destinations, passed to `ssh` verbatim; a host may also be a table `{ addr, group, sudo, root }` overriding the defaults below |
 | `build.command` | none | local build, run once per deploy via `sh -c` |
 | `build.artifact` | — | file or directory uploaded as the release |
 | `remote.root` | `/srv/{app}` | release layout location on the host |
 | `remote.keep_releases` | `5` | releases kept after a successful deploy |
 | `remote.sudo` | `true` | prefix privileged remote commands with `sudo -n` |
+| `rollout.canary` | `0` | hosts that must fully succeed before the rest start |
+| `rollout.parallel` | `1` | hosts deployed concurrently within a wave |
 | `service.exec_start` | — | `ExecStart=`; `{current}` expands to `{root}/current` |
+| `service.scope` | `system` | `user` runs under `systemctl --user`, no sudo anywhere |
 | `service.user` | none | `User=` in the unit |
 | `service.env` | `{}` | `Environment=` lines |
 | `service.unit_extra` | `[]` | verbatim extra `[Service]` lines |
@@ -98,9 +107,9 @@ command it would execute, verbatim, without touching anything.
 | `healthcheck.retries` | `5` | attempts before the deploy counts as failed |
 | `healthcheck.delay_ms` | `1000` | pause between attempts |
 | `secrets.file` | `secrets.env.age` | age-encrypted dotenv, committed to the repo |
-| `secrets.identity` | `~/.config/slipway/identity.txt` | local age identity used to decrypt |
-| `secrets.recipients` | `[]` | age public keys allowed to re-encrypt |
-| `secrets.mode` | `env-file` | `env-file` or `credential` |
+| `secrets.identity` | `~/.config/slipway/identity.txt` | age identity or OpenSSH private key used to decrypt |
+| `secrets.recipients` | `[]` | `age1...` or `ssh-ed25519/ssh-rsa` public keys allowed to re-encrypt |
+| `secrets.mode` | `env-file` | `env-file`, `credential`, or `encrypted-credential` |
 
 ## How a deploy works
 
@@ -132,6 +141,12 @@ The unit references only `{root}/current`, so routine deploys never rewrite
 it, and `slipway rollback` is nothing more exotic than steps 4-5 aimed at
 the previous release.
 
+The fleet is walked in waves: `rollout.canary` hosts go first and all of
+them must pass their health checks before anything else starts;
+the rest follow in batches of `rollout.parallel`. The defaults —
+no canary, one host at a time — are exactly the sequential behavior you
+would script by hand.
+
 ## Secrets
 
 Deploys usually carry configuration that must not sit in git as plaintext.
@@ -151,7 +166,7 @@ The identity never leaves your machine. Encryption is the `age` crate
 built into slipway — no external binary — and the armored ciphertext
 diffs as text in git.
 
-Two ways for the service to consume it:
+Three ways for the service to consume it:
 
 - `mode = "env-file"` (default): the unit gets
   `EnvironmentFile={root}/shared/secrets.env` and the variables appear in
@@ -159,33 +174,40 @@ Two ways for the service to consume it:
 - `mode = "credential"`: the unit gets `LoadCredential=secrets.env:...`
   and the application reads `$CREDENTIALS_DIRECTORY/secrets.env` itself —
   the systemd-native way that keeps values out of the environment.
+- `mode = "encrypted-credential"`: like `credential`, but the payload is
+  piped into `systemd-creds encrypt` on the host, so what sits on disk is
+  encrypted with the host's own key (and its TPM when there is one), and
+  the unit reads it via `LoadCredentialEncrypted=`. Needs system scope and
+  systemd 250+.
+
+The identity may also be an existing OpenSSH private key: point
+`secrets.identity` at it and list teammates' `ssh-ed25519 ...` public keys
+as recipients. Keys with a passphrase are rejected — slipway never
+prompts.
 
 `secrets push` rotates without a redeploy: upload, restart, health-check;
 if the check fails, the previous secrets file comes back and the service
-restarts again. The host does store the decrypted file at rest — 0600,
-owned by the deploy user, readable by PID 1 but not by the service user.
-Host-bound encryption at rest (`systemd-creds`, TPM) is on the roadmap.
+restarts again. In the two plaintext modes the host stores the decrypted
+file at rest — 0600, owned by the deploy user, readable by PID 1 but not
+by the service user; `encrypted-credential` removes even that.
 
 ## Rollback, honestly
 
 - Rollback restores the previous binary and the previous secrets file, not
   the world: schema migrations, cache contents, and anything the new
   release wrote stay as they are.
-- Hosts deploy sequentially and the run stops at the first failure: hosts
-  before it keep the new release, hosts after it were never touched. The
-  failing host itself is rolled back automatically.
+- Hosts within a wave fail independently and each failing host rolls
+  itself back; the rollout stops between waves, so hosts in earlier waves
+  keep the new release and hosts in later waves were never touched. With
+  a canary configured, a canary failure means zero non-canary hosts moved.
 - A first deploy has nothing to roll back to; a failing health check there
   is reported and the release is left in place for inspection.
 
 ## Roadmap
 
-- parallel and canary deploys across the fleet
-- `slipway logs` / `slipway exec` passthroughs
-- host groups and per-host overrides in the config
-- user-level units (`systemctl --user`) for sudo-less deploys
-- host-bound secret encryption at rest (`systemd-creds`, TPM)
-- ssh keys as age identities for secrets
-- binary releases
+- multiple services per config file
+- `slipway diff`: what a deploy would change, before running it
+- crates.io packaging
 
 ## License
 
