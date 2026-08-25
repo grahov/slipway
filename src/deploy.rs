@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
-use crate::config::{Config, Target, secrets_path};
+use crate::config::{Config, ServiceScope, Target, secrets_path};
 use crate::release;
 use crate::secrets;
 use crate::ssh::Shell;
@@ -326,7 +326,8 @@ fn status_host(runner: &mut Runner, config: &Config, target: &Target) -> Result<
     let root = target.root.clone();
     let current = current_release(runner, &root)?;
     let active = runner.read(&format!(
-        "systemctl is-active {} 2>/dev/null || true",
+        "{} is-active {} 2>/dev/null || true",
+        sysctl(runner, config, false),
         config.unit_name()
     ))?;
     let ids = list_releases(runner, &root)?;
@@ -363,21 +364,46 @@ fn artifact_parts(artifact: &str) -> Result<(&Path, &str)> {
     Ok((parent, name))
 }
 
+/// systemctl invocation for the configured scope; `privileged` adds sudo
+/// only where it is needed (mutations in system scope — reads run plain).
+fn sysctl(runner: &Runner, config: &Config, privileged: bool) -> String {
+    match config.service.scope {
+        ServiceScope::System if privileged => format!("{}systemctl", runner.shell.sudo_prefix()),
+        ServiceScope::System => "systemctl".to_string(),
+        ServiceScope::User => "XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user".to_string(),
+    }
+}
+
+fn unit_path(config: &Config) -> String {
+    let unit_name = config.unit_name();
+    match config.service.scope {
+        ServiceScope::System => format!("/etc/systemd/system/{unit_name}"),
+        ServiceScope::User => format!("$HOME/.config/systemd/user/{unit_name}"),
+    }
+}
+
 fn sync_unit(runner: &mut Runner, config: &Config, rendered: &str) -> Result<()> {
     let host = runner.host();
     let unit_name = config.unit_name();
-    let path = format!("/etc/systemd/system/{unit_name}");
+    let path = unit_path(config);
     let existing = runner.read(&format!("cat {path} 2>/dev/null || true"))?;
     if existing == rendered.trim_end() {
         return Ok(());
     }
     ui::step(&host, "install unit");
-    let sudo = runner.shell.sudo_prefix();
+    let ctl = sysctl(runner, config, true);
     let tmp = format!("/tmp/slipway-{unit_name}.tmp");
     runner.feed(&format!("cat > {tmp}"), rendered)?;
+    let install = match config.service.scope {
+        ServiceScope::System => {
+            format!("{}install -m 0644 {tmp} {path}", runner.shell.sudo_prefix())
+        }
+        ServiceScope::User => {
+            format!("mkdir -p $HOME/.config/systemd/user && install -m 0644 {tmp} {path}")
+        }
+    };
     runner.run(&format!(
-        "{sudo}install -m 0644 {tmp} {path} && rm -f {tmp} \
-         && {sudo}systemctl daemon-reload && {sudo}systemctl enable {unit_name}"
+        "{install} && rm -f {tmp} && {ctl} daemon-reload && {ctl} enable {unit_name}"
     ))?;
     Ok(())
 }
@@ -422,8 +448,8 @@ fn prune(runner: &mut Runner, config: &Config, root: &str, current: &str) -> Res
 }
 
 fn restart(runner: &mut Runner, config: &Config) -> Result<()> {
-    let sudo = runner.shell.sudo_prefix();
-    runner.run(&format!("{sudo}systemctl restart {}", config.unit_name()))
+    let ctl = sysctl(runner, config, true);
+    runner.run(&format!("{ctl} restart {}", config.unit_name()))
 }
 
 fn check_health(runner: &mut Runner, config: &Config) -> Result<()> {
@@ -618,6 +644,27 @@ mod tests {
         );
         assert!(selected(&config, &opts(Some("app"), Some("db"))).is_err());
         assert!(selected(&config, &opts(None, Some("cache"))).is_err());
+    }
+
+    #[test]
+    fn user_scope_plan_never_uses_sudo() {
+        let mut config = test_config();
+        config.service.scope = ServiceScope::User;
+        let target = first_target(&config);
+        let mut runner = Runner::new(&target, true);
+        deploy_host(&mut runner, &config, &target, "20260825120000", None).unwrap();
+        let plan = runner.log.join("\n");
+        assert!(!plan.contains("sudo"));
+        assert!(plan.contains("cat $HOME/.config/systemd/user/demo.service 2>/dev/null || true"));
+        assert!(plan.contains(
+            "mkdir -p $HOME/.config/systemd/user \
+             && install -m 0644 /tmp/slipway-demo.service.tmp $HOME/.config/systemd/user/demo.service"
+        ));
+        assert!(
+            plan.contains(
+                "XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user restart demo.service"
+            )
+        );
     }
 
     #[test]

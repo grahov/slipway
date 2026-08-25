@@ -2,7 +2,7 @@
 
 use std::fmt::Write;
 
-use crate::config::{Config, SecretsMode, secrets_path};
+use crate::config::{Config, SecretsMode, ServiceScope, secrets_path};
 
 /// Renders the full unit text for one host's root. The output references
 /// only `{root}/current`, never a concrete release, so the unit changes
@@ -43,7 +43,11 @@ pub fn render(config: &Config, root: &str) -> String {
     let _ = writeln!(unit, "RestartSec=2");
     let _ = writeln!(unit);
     let _ = writeln!(unit, "[Install]");
-    let _ = writeln!(unit, "WantedBy=multi-user.target");
+    let wanted_by = match config.service.scope {
+        ServiceScope::System => "multi-user.target",
+        ServiceScope::User => "default.target",
+    };
+    let _ = writeln!(unit, "WantedBy={wanted_by}");
     unit
 }
 
@@ -111,6 +115,24 @@ WantedBy=multi-user.target
         assert!(rendered.contains("ExecStart=/srv/demo/current/demo\n"));
         assert!(!rendered.contains("User="));
         assert!(!rendered.contains("Environment="));
+    }
+
+    #[test]
+    fn user_scope_wants_the_default_target() {
+        let config = config(
+            r#"
+            app = "demo"
+            hosts = ["h1"]
+            [build]
+            artifact = "out/demo"
+            [service]
+            exec_start = "{current}/demo"
+            scope = "user"
+        "#,
+        );
+        let rendered = render(&config, "/srv/demo");
+        assert!(rendered.contains("WantedBy=default.target\n"));
+        assert!(!rendered.contains("multi-user.target"));
     }
 
     #[test]

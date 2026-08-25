@@ -103,11 +103,25 @@ pub struct Service {
     /// Command line for `ExecStart=`; the `{current}` placeholder expands
     /// to `{root}/current` at render time.
     pub exec_start: String,
+    #[serde(default)]
+    pub scope: ServiceScope,
     pub user: Option<String>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
     #[serde(default)]
     pub unit_extra: Vec<String>,
+}
+
+/// Which systemd manager owns the service.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ServiceScope {
+    /// PID 1: unit in `/etc/systemd/system`, needs sudo or root.
+    #[default]
+    System,
+    /// The ssh user's manager: unit in `~/.config/systemd/user`, no sudo
+    /// anywhere; survives logout only with `loginctl enable-linger`.
+    User,
 }
 
 #[derive(Debug, Deserialize)]
@@ -187,6 +201,7 @@ artifact = "target/release/myapp"
 [service]
 # {current} expands to the `current` symlink, e.g. /srv/myapp/current.
 exec_start = "{current}/myapp"
+# scope = "system"            # or "user": sudo-less, needs loginctl enable-linger
 # user = "myapp"
 # env = { RUST_LOG = "info" }
 # unit_extra = ["LimitNOFILE=65536"]
