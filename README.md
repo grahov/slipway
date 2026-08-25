@@ -71,6 +71,9 @@ command it would execute, verbatim, without touching anything.
 | `slipway deploy` | build, upload, flip, restart, health-check every host |
 | `slipway rollback` | flip hosts back to the release preceding the current one |
 | `slipway status` | current release, service state, recent releases per host |
+| `slipway secrets init` | create the age identity, then the encrypted secrets file |
+| `slipway secrets edit` | decrypt into `$EDITOR`, validate, re-encrypt |
+| `slipway secrets push` | rotate secrets: upload, restart, health-check |
 
 `deploy` also takes `--dry-run` (print commands, execute nothing) and
 `--skip-build` (deploy the artifact as it is). All three commands accept
@@ -94,6 +97,10 @@ command it would execute, verbatim, without touching anything.
 | `healthcheck.command` | none | runs on the host; exit 0 means healthy |
 | `healthcheck.retries` | `5` | attempts before the deploy counts as failed |
 | `healthcheck.delay_ms` | `1000` | pause between attempts |
+| `secrets.file` | `secrets.env.age` | age-encrypted dotenv, committed to the repo |
+| `secrets.identity` | `~/.config/slipway/identity.txt` | local age identity used to decrypt |
+| `secrets.recipients` | `[]` | age public keys allowed to re-encrypt |
+| `secrets.mode` | `env-file` | `env-file` or `credential` |
 
 ## How a deploy works
 
@@ -125,10 +132,45 @@ The unit references only `{root}/current`, so routine deploys never rewrite
 it, and `slipway rollback` is nothing more exotic than steps 4-5 aimed at
 the previous release.
 
+## Secrets
+
+Deploys usually carry configuration that must not sit in git as plaintext.
+slipway's answer is one age-encrypted dotenv file that does sit in git:
+
+```
+slipway secrets init
+slipway secrets edit
+slipway secrets push
+```
+
+`init` creates a local identity and prints its public key — put it into
+`secrets.recipients` (one entry per teammate) and commit `secrets.env.age`.
+Every deploy then decrypts the file locally and installs it to
+`{root}/shared/secrets.env` on the host, mode 0600, before the restart.
+The identity never leaves your machine. Encryption is the `age` crate
+built into slipway — no external binary — and the armored ciphertext
+diffs as text in git.
+
+Two ways for the service to consume it:
+
+- `mode = "env-file"` (default): the unit gets
+  `EnvironmentFile={root}/shared/secrets.env` and the variables appear in
+  the process environment; no application changes.
+- `mode = "credential"`: the unit gets `LoadCredential=secrets.env:...`
+  and the application reads `$CREDENTIALS_DIRECTORY/secrets.env` itself —
+  the systemd-native way that keeps values out of the environment.
+
+`secrets push` rotates without a redeploy: upload, restart, health-check;
+if the check fails, the previous secrets file comes back and the service
+restarts again. The host does store the decrypted file at rest — 0600,
+owned by the deploy user, readable by PID 1 but not by the service user.
+Host-bound encryption at rest (`systemd-creds`, TPM) is on the roadmap.
+
 ## Rollback, honestly
 
-- Rollback restores the previous binary, not the world: schema migrations,
-  cache contents, and anything the new release wrote stay as they are.
+- Rollback restores the previous binary and the previous secrets file, not
+  the world: schema migrations, cache contents, and anything the new
+  release wrote stay as they are.
 - Hosts deploy sequentially and the run stops at the first failure: hosts
   before it keep the new release, hosts after it were never touched. The
   failing host itself is rolled back automatically.
@@ -141,6 +183,8 @@ the previous release.
 - `slipway logs` / `slipway exec` passthroughs
 - host groups and per-host overrides in the config
 - user-level units (`systemctl --user`) for sudo-less deploys
+- host-bound secret encryption at rest (`systemd-creds`, TPM)
+- ssh keys as age identities for secrets
 - binary releases
 
 ## License
