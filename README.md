@@ -124,8 +124,10 @@ Each host ends up with the classic capistrano layout:
 ```
 
 1. The build command runs locally, once.
-2. The artifact streams to the host as a tarball over a single ssh exec and
-   unpacks into `releases/{timestamp}`.
+2. On first contact the release root is created — with sudo it is chowned
+   to the deploy user, so root-owned parents like `/srv` need no manual
+   preparation. The artifact then streams to the host as a tarball over a
+   single ssh exec and unpacks into `releases/{timestamp}`.
 3. The systemd unit is rendered from config and installed only when its
    content changed, followed by `daemon-reload` and `enable`.
 4. `current` is flipped atomically: a temp symlink, then `mv -Tf`. A crash

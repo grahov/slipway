@@ -58,7 +58,10 @@ mod tests {
         assert!(is_id("20260825131500123"));
         assert!(!is_id("2026082513150012"));
         let mixed = names(&["20260825131500", "20260825131500123"]);
-        assert_eq!(prune_candidates(&mixed, 1, None), names(&["20260825131500"]));
+        assert_eq!(
+            prune_candidates(&mixed, 1, None),
+            names(&["20260825131500"])
+        );
     }
 
     #[test]
