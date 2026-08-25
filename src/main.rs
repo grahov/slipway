@@ -68,6 +68,18 @@ fn run() -> Result<()> {
                 },
             )
         }
+        Command::Logs {
+            common,
+            lines,
+            follow,
+        } => {
+            let config = Config::load(&common.config)?;
+            deploy::logs(&config, &fleet_opts(common), lines, follow)
+        }
+        Command::Exec { common, command } => {
+            let config = Config::load(&common.config)?;
+            deploy::exec(&config, &fleet_opts(common), &command)
+        }
         Command::Secrets { action } => match action {
             SecretsAction::Init { config } => secrets::init(&Config::load(&config)?),
             SecretsAction::Edit { config } => secrets::edit(&Config::load(&config)?),
@@ -84,6 +96,15 @@ fn run() -> Result<()> {
                 )
             }
         },
+    }
+}
+
+fn fleet_opts(common: cli::Common) -> Opts {
+    Opts {
+        dry_run: false,
+        skip_build: true,
+        host_filter: common.host,
+        group_filter: common.group,
     }
 }
 

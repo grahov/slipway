@@ -40,6 +40,25 @@ pub enum Command {
         #[command(flatten)]
         common: Common,
     },
+    /// Tail the service journal on the selected hosts
+    Logs {
+        #[command(flatten)]
+        common: Common,
+        /// Entries per host to print
+        #[arg(short = 'n', long, default_value_t = 50)]
+        lines: u32,
+        /// Follow the journal; needs exactly one selected host
+        #[arg(short, long)]
+        follow: bool,
+    },
+    /// Run a command on every selected host through the remote shell
+    Exec {
+        #[command(flatten)]
+        common: Common,
+        /// The command line to run remotely
+        #[arg(trailing_var_arg = true, required = true)]
+        command: Vec<String>,
+    },
     /// Manage the age-encrypted secrets file
     Secrets {
         #[command(subcommand)]

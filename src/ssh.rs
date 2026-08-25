@@ -67,6 +67,17 @@ impl Shell {
         Ok(status.success())
     }
 
+    /// Runs the script with stdio inherited, streaming straight to the
+    /// terminal; returns the remote exit code (None when killed by a
+    /// signal, e.g. Ctrl-C on a followed journal).
+    pub fn stream(&self, script: &str) -> Result<Option<i32>> {
+        let status = Command::new("ssh")
+            .args(self.ssh_args(script))
+            .status()
+            .context("cannot spawn ssh")?;
+        Ok(status.code())
+    }
+
     /// Runs the script with `input` on its stdin.
     pub fn run_with_input(&self, script: &str, input: &str) -> Result<()> {
         let mut child = Command::new("ssh")

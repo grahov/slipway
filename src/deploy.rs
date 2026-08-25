@@ -215,6 +215,62 @@ pub fn status(config: &Config, opts: &Opts) -> Result<()> {
     Ok(())
 }
 
+pub fn logs(config: &Config, opts: &Opts, lines: u32, follow: bool) -> Result<()> {
+    let targets = selected(config, opts)?;
+    if follow && targets.len() > 1 {
+        bail!(
+            "--follow needs exactly one selected host (narrow with --host/--group); \
+             for a merged live tail across hosts there is jtail"
+        );
+    }
+    for target in &targets {
+        if targets.len() > 1 {
+            ui::note(&format!("== {} ==", target.addr));
+        }
+        let shell = Shell::new(&target.addr, target.sudo);
+        let code = shell.stream(&logs_script(config, lines, follow))?;
+        if follow {
+            return Ok(());
+        }
+        if code != Some(0) {
+            bail!("journalctl failed on {}", target.addr);
+        }
+    }
+    Ok(())
+}
+
+fn logs_script(config: &Config, lines: u32, follow: bool) -> String {
+    let unit_name = config.unit_name();
+    let unit_flag = match config.service.scope {
+        ServiceScope::System => format!("-u {unit_name}"),
+        ServiceScope::User => format!("--user-unit {unit_name}"),
+    };
+    let follow_flag = if follow { " -f" } else { "" };
+    format!("journalctl {unit_flag} -n {lines} --no-pager{follow_flag}")
+}
+
+/// Runs on every selected host even when some fail, then reports the
+/// failures together: fleet-wide one-liners should not stop at the first
+/// non-zero exit.
+pub fn exec(config: &Config, opts: &Opts, command: &[String]) -> Result<()> {
+    let script = command.join(" ");
+    let mut failures = Vec::new();
+    for target in selected(config, opts)? {
+        ui::note(&format!("== {} ==", target.addr));
+        let shell = Shell::new(&target.addr, target.sudo);
+        match shell.stream(&script)? {
+            Some(0) => {}
+            Some(code) => failures.push(format!("{} (exit {code})", target.addr)),
+            None => failures.push(format!("{} (signal)", target.addr)),
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        bail!("exec failed on {}", failures.join(", "))
+    }
+}
+
 fn selected(config: &Config, opts: &Opts) -> Result<Vec<Target>> {
     let targets: Vec<Target> = config
         .targets()
@@ -671,6 +727,24 @@ mod tests {
             plan.contains(
                 "XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user restart demo.service"
             )
+        );
+    }
+
+    #[test]
+    fn logs_script_follows_scope_and_flags() {
+        let mut config = test_config();
+        assert_eq!(
+            logs_script(&config, 50, false),
+            "journalctl -u demo.service -n 50 --no-pager"
+        );
+        assert_eq!(
+            logs_script(&config, 10, true),
+            "journalctl -u demo.service -n 10 --no-pager -f"
+        );
+        config.service.scope = ServiceScope::User;
+        assert_eq!(
+            logs_script(&config, 50, false),
+            "journalctl --user-unit demo.service -n 50 --no-pager"
         );
     }
 
