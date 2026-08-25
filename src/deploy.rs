@@ -8,6 +8,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::config::Config;
 use crate::release;
+use crate::secrets;
 use crate::ssh::Shell;
 use crate::ui;
 use crate::unit;
@@ -93,13 +94,43 @@ pub fn deploy(config: &Config, opts: &Opts) -> Result<()> {
     build(config, opts)?;
     let id = release::new_id();
     let unit_text = unit::render(config);
+    let secret_text = load_secret_text(config, opts.dry_run)?;
     for host in hosts {
         let mut runner = Runner::new(config, &host, opts.dry_run);
-        deploy_host(&mut runner, config, &id, &unit_text)
+        deploy_host(&mut runner, config, &id, &unit_text, secret_text.as_deref())
             .with_context(|| format!("deploy of {id} failed on {host}"))?;
     }
     ui::ok(&format!("deployed {id}"));
     Ok(())
+}
+
+/// `slipway secrets push`: rotate secrets without a redeploy. A failed
+/// health check restores the previous file and restarts, mirroring what a
+/// failed deploy does for releases.
+pub fn secrets_push(config: &Config, opts: &Opts) -> Result<()> {
+    secrets::required(config)?;
+    let secret_text = load_secret_text(config, opts.dry_run)?;
+    let path = config.secrets_path();
+    for host in selected(config, opts)? {
+        let mut runner = Runner::new(config, &host, opts.dry_run);
+        push_host(&mut runner, config, &path, secret_text.as_deref())
+            .with_context(|| format!("secrets push failed on {host}"))?;
+    }
+    ui::ok("secrets pushed");
+    Ok(())
+}
+
+/// Decrypted once per run and never in dry mode: `--dry-run` must work on
+/// a machine without the identity, and traces carry scripts only.
+fn load_secret_text(config: &Config, dry: bool) -> Result<Option<String>> {
+    match &config.secrets {
+        Some(secrets) if !dry => {
+            let text = secrets::decrypt(secrets)?;
+            secrets::validate_dotenv(&text)?;
+            Ok(Some(text))
+        }
+        _ => Ok(None),
+    }
 }
 
 pub fn rollback(config: &Config, opts: &Opts) -> Result<()> {
@@ -157,12 +188,25 @@ fn build(config: &Config, opts: &Opts) -> Result<()> {
     Ok(())
 }
 
-fn deploy_host(runner: &mut Runner, config: &Config, id: &str, unit_text: &str) -> Result<()> {
+fn deploy_host(
+    runner: &mut Runner,
+    config: &Config,
+    id: &str,
+    unit_text: &str,
+    secret_text: Option<&str>,
+) -> Result<()> {
     let host = runner.host();
     let root = config.root();
     ui::step(&host, &format!("release {id}"));
     let (parent, name) = artifact_parts(&config.build.artifact)?;
     runner.upload(parent, name, &format!("{root}/releases/{id}"))?;
+    if config.secrets.is_some() {
+        ui::step(&host, "install secrets");
+        runner.feed(
+            &secrets::upload_script(&config.secrets_path()),
+            secret_text.unwrap_or(""),
+        )?;
+    }
     sync_unit(runner, config, unit_text)?;
     let previous = current_release(runner, &root)?;
     ui::step(&host, "flip current and restart");
@@ -349,11 +393,39 @@ fn recover(
     };
     ui::fail(&format!("  {host} unhealthy, rolling back to {previous}"));
     flip(runner, &config.root(), &previous)?;
+    if config.secrets.is_some() {
+        runner.run(&secrets::restore_script(&config.secrets_path()))?;
+    }
     restart(runner, config)?;
     match check_health(runner, config) {
         Ok(()) => bail!("{err:#}; rolled back to {previous}, which is healthy again"),
         Err(second) => bail!("{err:#}; rolled back to {previous}, but: {second:#}"),
     }
+}
+
+fn push_host(
+    runner: &mut Runner,
+    config: &Config,
+    path: &str,
+    secret_text: Option<&str>,
+) -> Result<()> {
+    let host = runner.host();
+    ui::step(&host, "install secrets");
+    runner.feed(&secrets::upload_script(path), secret_text.unwrap_or(""))?;
+    restart(runner, config)?;
+    if let Err(err) = check_health(runner, config) {
+        ui::fail(&format!(
+            "  {host} unhealthy, restoring the previous secrets"
+        ));
+        runner.run(&secrets::restore_script(path))?;
+        restart(runner, config)?;
+        match check_health(runner, config) {
+            Ok(()) => bail!("{err:#}; previous secrets restored, service healthy again"),
+            Err(second) => bail!("{err:#}; previous secrets restored, but: {second:#}"),
+        }
+    }
+    ui::step(&host, "done");
+    Ok(())
 }
 
 #[cfg(test)]
@@ -381,7 +453,7 @@ mod tests {
         let config = test_config();
         let unit_text = unit::render(&config);
         let mut runner = Runner::new(&config, "deploy@h1", true);
-        deploy_host(&mut runner, &config, "20260825120000", &unit_text).unwrap();
+        deploy_host(&mut runner, &config, "20260825120000", &unit_text, None).unwrap();
         let expected = [
             "ssh deploy@h1 mkdir -p /srv/demo/releases/20260825120000 \
              && tar -xzf - -C /srv/demo/releases/20260825120000",
@@ -398,6 +470,40 @@ mod tests {
             "ssh deploy@h1 ls -1 /srv/demo/releases 2>/dev/null || true",
         ];
         assert_eq!(runner.log, expected);
+    }
+
+    #[test]
+    fn dry_run_plan_with_secrets_adds_one_feed_step() {
+        let mut config = test_config();
+        config.secrets = Some(crate::config::Secrets::default());
+        let unit_text = unit::render(&config);
+        let mut runner = Runner::new(&config, "deploy@h1", true);
+        deploy_host(&mut runner, &config, "20260825120000", &unit_text, None).unwrap();
+        assert_eq!(runner.log.len(), 10);
+        assert_eq!(
+            runner.log[1],
+            format!(
+                "ssh deploy@h1 {}",
+                secrets::upload_script("/srv/demo/shared/secrets.env")
+            )
+        );
+    }
+
+    #[test]
+    fn push_plan_uploads_restarts_and_checks() {
+        let mut config = test_config();
+        config.secrets = Some(crate::config::Secrets::default());
+        let path = config.secrets_path();
+        let mut runner = Runner::new(&config, "deploy@h1", true);
+        push_host(&mut runner, &config, &path, None).unwrap();
+        assert_eq!(
+            runner.log,
+            [
+                format!("ssh deploy@h1 {}", secrets::upload_script(&path)),
+                "ssh deploy@h1 sudo -n systemctl restart demo.service".to_string(),
+                "ssh deploy@h1 curl -fsS http://127.0.0.1:8080/health".to_string(),
+            ]
+        );
     }
 
     #[test]

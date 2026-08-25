@@ -2,7 +2,7 @@
 
 use std::fmt::Write;
 
-use crate::config::Config;
+use crate::config::{Config, SecretsMode};
 
 /// Renders the full unit text. The output references only `{root}/current`,
 /// never a concrete release, so the unit changes when the config changes
@@ -28,6 +28,13 @@ pub fn render(config: &Config) -> String {
     }
     for (key, value) in &config.service.env {
         let _ = writeln!(unit, "Environment=\"{key}={value}\"");
+    }
+    if let Some(secrets) = &config.secrets {
+        let path = config.secrets_path();
+        let _ = match secrets.mode {
+            SecretsMode::EnvFile => writeln!(unit, "EnvironmentFile={path}"),
+            SecretsMode::Credential => writeln!(unit, "LoadCredential=secrets.env:{path}"),
+        };
     }
     for extra in &config.service.unit_extra {
         let _ = writeln!(unit, "{extra}");
@@ -104,5 +111,24 @@ WantedBy=multi-user.target
         assert!(rendered.contains("ExecStart=/srv/demo/current/demo\n"));
         assert!(!rendered.contains("User="));
         assert!(!rendered.contains("Environment="));
+    }
+
+    #[test]
+    fn renders_the_secrets_line_per_mode() {
+        let base = r#"
+            app = "demo"
+            hosts = ["h1"]
+            [build]
+            artifact = "out/demo"
+            [service]
+            exec_start = "{current}/demo"
+            [secrets]
+        "#;
+        let env_file = render(&config(base));
+        assert!(env_file.contains("EnvironmentFile=/srv/demo/shared/secrets.env\n"));
+
+        let credential = render(&config(&format!("{base}mode = \"credential\"\n")));
+        assert!(credential.contains("LoadCredential=secrets.env:/srv/demo/shared/secrets.env\n"));
+        assert!(!credential.contains("EnvironmentFile="));
     }
 }

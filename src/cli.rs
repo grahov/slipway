@@ -40,6 +40,35 @@ pub enum Command {
         #[command(flatten)]
         common: Common,
     },
+    /// Manage the age-encrypted secrets file
+    Secrets {
+        #[command(subcommand)]
+        action: SecretsAction,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum SecretsAction {
+    /// Create the local identity, then the encrypted secrets file
+    Init {
+        /// Path to the config file
+        #[arg(short, long, default_value = "slipway.toml")]
+        config: PathBuf,
+    },
+    /// Decrypt into $EDITOR, validate, re-encrypt to every recipient
+    Edit {
+        /// Path to the config file
+        #[arg(short, long, default_value = "slipway.toml")]
+        config: PathBuf,
+    },
+    /// Upload the current secrets to the hosts, restart, health-check
+    Push {
+        #[command(flatten)]
+        common: Common,
+        /// Print every command instead of executing anything
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Args)]

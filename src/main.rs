@@ -4,6 +4,7 @@ mod cli;
 mod config;
 mod deploy;
 mod release;
+mod secrets;
 mod ssh;
 mod ui;
 mod unit;
@@ -13,7 +14,7 @@ use std::path::Path;
 use anyhow::{Result, bail};
 use clap::Parser;
 
-use crate::cli::{Cli, Command};
+use crate::cli::{Cli, Command, SecretsAction};
 use crate::config::Config;
 use crate::deploy::Opts;
 
@@ -64,6 +65,21 @@ fn run() -> Result<()> {
                 },
             )
         }
+        Command::Secrets { action } => match action {
+            SecretsAction::Init { config } => secrets::init(&Config::load(&config)?),
+            SecretsAction::Edit { config } => secrets::edit(&Config::load(&config)?),
+            SecretsAction::Push { common, dry_run } => {
+                let config = Config::load(&common.config)?;
+                deploy::secrets_push(
+                    &config,
+                    &Opts {
+                        dry_run,
+                        skip_build: true,
+                        host_filter: common.host,
+                    },
+                )
+            }
+        },
     }
 }
 

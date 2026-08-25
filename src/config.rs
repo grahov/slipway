@@ -20,6 +20,7 @@ pub struct Config {
     pub remote: Remote,
     pub service: Service,
     pub healthcheck: Option<Healthcheck>,
+    pub secrets: Option<Secrets>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -79,6 +80,41 @@ fn default_delay_ms() -> u64 {
     1000
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Secrets {
+    /// age-encrypted dotenv file, committed next to the code.
+    pub file: String,
+    /// Local age identity file used to decrypt at deploy time; a leading
+    /// `~/` expands via `$HOME`. The identity never leaves this machine.
+    pub identity: String,
+    /// age public keys allowed to re-encrypt with `secrets edit`.
+    pub recipients: Vec<String>,
+    pub mode: SecretsMode,
+}
+
+impl Default for Secrets {
+    fn default() -> Self {
+        Self {
+            file: "secrets.env.age".into(),
+            identity: "~/.config/slipway/identity.txt".into(),
+            recipients: Vec::new(),
+            mode: SecretsMode::EnvFile,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SecretsMode {
+    /// `EnvironmentFile=` in the unit: variables land in the process
+    /// environment, no application changes needed.
+    EnvFile,
+    /// `LoadCredential=` in the unit: the application reads the file at
+    /// `$CREDENTIALS_DIRECTORY/secrets.env` itself.
+    Credential,
+}
+
 /// The commented template written by `slipway init`.
 pub const EXAMPLE: &str = r#"# slipway deploys this app to every host listed below.
 app = "myapp"
@@ -107,6 +143,14 @@ exec_start = "{current}/myapp"
 command = "curl -fsS http://127.0.0.1:8080/health"
 # retries = 5
 # delay_ms = 1000
+
+# [secrets]
+# Age-encrypted env file, committed to the repo. `slipway secrets init`
+# creates the identity and prints the public key to put into recipients.
+# file = "secrets.env.age"
+# identity = "~/.config/slipway/identity.txt"
+# recipients = ["age1..."]
+# mode = "env-file"            # or "credential"
 "#;
 
 impl Config {
@@ -128,6 +172,12 @@ impl Config {
 
     pub fn unit_name(&self) -> String {
         format!("{}.service", self.app)
+    }
+
+    /// The one remote location for decrypted secrets; both the deploy
+    /// pipeline and the unit renderer must agree on it.
+    pub fn secrets_path(&self) -> String {
+        format!("{}/shared/secrets.env", self.root())
     }
 
     /// Rejects values that could break out of the remote command lines and
@@ -181,6 +231,16 @@ impl Config {
             }
             if hc.retries == 0 {
                 bail!("healthcheck.retries must be at least 1");
+            }
+        }
+        if let Some(secrets) = &self.secrets {
+            if secrets.file.is_empty() || secrets.identity.is_empty() {
+                bail!("secrets.file and secrets.identity must not be empty");
+            }
+            for recipient in &secrets.recipients {
+                if recipient.parse::<age::x25519::Recipient>().is_err() {
+                    bail!("secrets.recipients entry {recipient:?} is not an age public key");
+                }
             }
         }
         Ok(())
@@ -262,5 +322,20 @@ mod tests {
     fn rejects_unknown_fields() {
         let text = MINIMAL.replace("[build]", "typo = 1\n[build]");
         assert!(parse(&text).is_err());
+    }
+
+    #[test]
+    fn secrets_table_gets_defaults_and_rejects_bad_values() {
+        let with_secrets = format!("{MINIMAL}\n[secrets]\n");
+        let config = parse(&with_secrets).unwrap();
+        assert_eq!(config.secrets_path(), "/srv/demo/shared/secrets.env");
+        let secrets = config.secrets.unwrap();
+        assert_eq!(secrets.file, "secrets.env.age");
+        assert_eq!(secrets.mode, SecretsMode::EnvFile);
+
+        let bad_mode = format!("{MINIMAL}\n[secrets]\nmode = \"tpm\"\n");
+        assert!(parse(&bad_mode).is_err());
+        let bad_recipient = format!("{MINIMAL}\n[secrets]\nrecipients = [\"bob\"]\n");
+        assert!(parse(&bad_recipient).is_err());
     }
 }
