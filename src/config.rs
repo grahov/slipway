@@ -176,6 +176,10 @@ pub enum SecretsMode {
     /// `LoadCredential=` in the unit: the application reads the file at
     /// `$CREDENTIALS_DIRECTORY/secrets.env` itself.
     Credential,
+    /// Like `credential`, but the payload is re-encrypted on the host with
+    /// `systemd-creds encrypt` (host key, TPM when present) and wired via
+    /// `LoadCredentialEncrypted=`. Needs system scope and systemd 250+.
+    EncryptedCredential,
 }
 
 /// The commented template written by `slipway init`.
@@ -218,7 +222,7 @@ command = "curl -fsS http://127.0.0.1:8080/health"
 # file = "secrets.env.age"
 # identity = "~/.config/slipway/identity.txt"
 # recipients = ["age1..."]
-# mode = "env-file"            # or "credential"
+# mode = "env-file"            # or "credential", "encrypted-credential"
 "#;
 
 impl Config {
@@ -326,6 +330,11 @@ impl Config {
             if secrets.file.is_empty() || secrets.identity.is_empty() {
                 bail!("secrets.file and secrets.identity must not be empty");
             }
+            if secrets.mode == SecretsMode::EncryptedCredential
+                && self.service.scope == ServiceScope::User
+            {
+                bail!("secrets.mode = \"encrypted-credential\" needs a system-scope service");
+            }
             for recipient in &secrets.recipients {
                 if recipient.parse::<age::x25519::Recipient>().is_err() {
                     bail!("secrets.recipients entry {recipient:?} is not an age public key");
@@ -351,6 +360,15 @@ impl Config {
 /// the deploy pipeline and the unit renderer must agree on it.
 pub fn secrets_path(root: &str) -> String {
     format!("{root}/shared/secrets.env")
+}
+
+/// The remote file the unit reads for the given mode: the plaintext dotenv,
+/// or its host-encrypted `.cred` form.
+pub fn secrets_remote_file(root: &str, mode: SecretsMode) -> String {
+    match mode {
+        SecretsMode::EncryptedCredential => format!("{root}/shared/secrets.env.cred"),
+        _ => secrets_path(root),
+    }
 }
 
 fn is_name_char(c: char) -> bool {
@@ -456,6 +474,15 @@ mod tests {
         let secrets = config.secrets.unwrap();
         assert_eq!(secrets.file, "secrets.env.age");
         assert_eq!(secrets.mode, SecretsMode::EnvFile);
+
+        let encrypted_user = format!(
+            "{}\n[secrets]\nmode = \"encrypted-credential\"\n",
+            MINIMAL.replace(
+                "exec_start = \"{current}/demo\"",
+                "exec_start = \"{current}/demo\"\nscope = \"user\""
+            )
+        );
+        assert!(parse(&encrypted_user).is_err());
 
         let bad_mode = format!("{MINIMAL}\n[secrets]\nmode = \"tpm\"\n");
         assert!(parse(&bad_mode).is_err());

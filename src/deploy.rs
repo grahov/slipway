@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
-use crate::config::{Config, ServiceScope, Target, secrets_path};
+use crate::config::{Config, ServiceScope, Target};
 use crate::release;
 use crate::secrets;
 use crate::ssh::Shell;
@@ -269,10 +269,10 @@ fn deploy_host(
     ui::step(&host, &format!("release {id}"));
     let (parent, name) = artifact_parts(&config.build.artifact)?;
     runner.upload(parent, name, &format!("{root}/releases/{id}"))?;
-    if config.secrets.is_some() {
+    if let Some(sec) = &config.secrets {
         ui::step(&host, "install secrets");
         runner.feed(
-            &secrets::upload_script(&secrets_path(root)),
+            &secrets::upload_script(root, sec.mode, target.sudo),
             secret_text.unwrap_or(""),
         )?;
     }
@@ -489,8 +489,12 @@ fn recover(
     };
     ui::fail(&format!("  {host} unhealthy, rolling back to {previous}"));
     flip(runner, &target.root, &previous)?;
-    if config.secrets.is_some() {
-        runner.run(&secrets::restore_script(&secrets_path(&target.root)))?;
+    if let Some(sec) = &config.secrets {
+        runner.run(&secrets::restore_script(
+            &target.root,
+            sec.mode,
+            target.sudo,
+        ))?;
     }
     restart(runner, config)?;
     match check_health(runner, config) {
@@ -506,15 +510,18 @@ fn push_host(
     secret_text: Option<&str>,
 ) -> Result<()> {
     let host = runner.host();
-    let path = &secrets_path(&target.root);
+    let mode = secrets::required(config)?.mode;
     ui::step(&host, "install secrets");
-    runner.feed(&secrets::upload_script(path), secret_text.unwrap_or(""))?;
+    runner.feed(
+        &secrets::upload_script(&target.root, mode, target.sudo),
+        secret_text.unwrap_or(""),
+    )?;
     restart(runner, config)?;
     if let Err(err) = check_health(runner, config) {
         ui::fail(&format!(
             "  {host} unhealthy, restoring the previous secrets"
         ));
-        runner.run(&secrets::restore_script(path))?;
+        runner.run(&secrets::restore_script(&target.root, mode, target.sudo))?;
         restart(runner, config)?;
         match check_health(runner, config) {
             Ok(()) => bail!("{err:#}; previous secrets restored, service healthy again"),
@@ -585,7 +592,7 @@ mod tests {
             runner.log[1],
             format!(
                 "ssh deploy@h1 {}",
-                secrets::upload_script("/srv/demo/shared/secrets.env")
+                secrets::upload_script("/srv/demo", crate::config::SecretsMode::EnvFile, true)
             )
         );
     }
@@ -597,11 +604,11 @@ mod tests {
         let target = first_target(&config);
         let mut runner = Runner::new(&target, true);
         push_host(&mut runner, &config, &target, None).unwrap();
-        let path = secrets_path(&target.root);
+        let upload = secrets::upload_script("/srv/demo", crate::config::SecretsMode::EnvFile, true);
         assert_eq!(
             runner.log,
             [
-                format!("ssh deploy@h1 {}", secrets::upload_script(&path)),
+                format!("ssh deploy@h1 {upload}"),
                 "ssh deploy@h1 sudo -n systemctl restart demo.service".to_string(),
                 "ssh deploy@h1 curl -fsS http://127.0.0.1:8080/health".to_string(),
             ]

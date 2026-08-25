@@ -18,7 +18,7 @@ use age::secrecy::ExposeSecret;
 use age::x25519::{Identity, Recipient};
 use anyhow::{Context, Result, bail};
 
-use crate::config::{Config, Secrets};
+use crate::config::{Config, Secrets, SecretsMode, secrets_remote_file};
 use crate::ui;
 
 /// Expands a leading `~/` via `$HOME`; other paths pass through.
@@ -116,19 +116,49 @@ pub fn validate_dotenv(text: &str) -> Result<()> {
     Ok(())
 }
 
-/// One remote script per overwrite: back up, write via a temp file, tighten
-/// the mode, move into place. The plaintext arrives on stdin and never
-/// appears in a command line.
-pub fn upload_script(path: &str) -> String {
-    let dir = path.rsplit_once('/').map(|(dir, _)| dir).unwrap_or(path);
-    format!(
-        "mkdir -p {dir} && if [ -f {path} ]; then cp -p {path} {path}.prev; fi \
-         && cat > {path}.tmp && chmod 600 {path}.tmp && mv -f {path}.tmp {path}"
-    )
+/// One remote script per overwrite: back up, write via a temp file, move
+/// into place. The plaintext arrives on stdin and never appears in a
+/// command line. In `encrypted-credential` mode the stream goes straight
+/// into `systemd-creds encrypt`, so the host never stores it unencrypted;
+/// that path runs as root because the host key is root-only.
+pub fn upload_script(root: &str, mode: SecretsMode, sudo: bool) -> String {
+    let file = secrets_remote_file(root, mode);
+    let dir = file
+        .rsplit_once('/')
+        .map(|(dir, _)| dir.to_string())
+        .unwrap_or_default();
+    let backup = format!("mkdir -p {dir} && if [ -f {file} ]; then cp -p {file} {file}.prev; fi");
+    match mode {
+        SecretsMode::EncryptedCredential => wrap_root(
+            format!(
+                "{backup} && systemd-creds encrypt --name=secrets.env - {file}.tmp \
+                 && mv -f {file}.tmp {file}"
+            ),
+            sudo,
+        ),
+        _ => format!(
+            "{backup} && cat > {file}.tmp && chmod 600 {file}.tmp && mv -f {file}.tmp {file}"
+        ),
+    }
 }
 
-pub fn restore_script(path: &str) -> String {
-    format!("if [ -f {path}.prev ]; then mv -f {path}.prev {path}; fi")
+pub fn restore_script(root: &str, mode: SecretsMode, sudo: bool) -> String {
+    let file = secrets_remote_file(root, mode);
+    let script = format!("if [ -f {file}.prev ]; then mv -f {file}.prev {file}; fi");
+    match mode {
+        SecretsMode::EncryptedCredential => wrap_root(script, sudo),
+        _ => script,
+    }
+}
+
+/// Config validation forbids single quotes in every interpolated path, so
+/// the wrapped script cannot escape the quoting.
+fn wrap_root(script: String, sudo: bool) -> String {
+    if sudo {
+        format!("sudo -n sh -c '{script}'")
+    } else {
+        script
+    }
 }
 
 /// `slipway secrets init`: create the identity when missing, print its
@@ -261,9 +291,8 @@ mod tests {
 
     #[test]
     fn remote_scripts_back_up_and_restore() {
-        let path = "/srv/demo/shared/secrets.env";
         assert_eq!(
-            upload_script(path),
+            upload_script("/srv/demo", SecretsMode::EnvFile, true),
             "mkdir -p /srv/demo/shared \
              && if [ -f /srv/demo/shared/secrets.env ]; then \
 cp -p /srv/demo/shared/secrets.env /srv/demo/shared/secrets.env.prev; fi \
@@ -272,9 +301,28 @@ cp -p /srv/demo/shared/secrets.env /srv/demo/shared/secrets.env.prev; fi \
              && mv -f /srv/demo/shared/secrets.env.tmp /srv/demo/shared/secrets.env"
         );
         assert_eq!(
-            restore_script(path),
+            restore_script("/srv/demo", SecretsMode::EnvFile, true),
             "if [ -f /srv/demo/shared/secrets.env.prev ]; then \
 mv -f /srv/demo/shared/secrets.env.prev /srv/demo/shared/secrets.env; fi"
+        );
+    }
+
+    #[test]
+    fn encrypted_mode_streams_into_systemd_creds_as_root() {
+        let script = upload_script("/srv/demo", SecretsMode::EncryptedCredential, true);
+        assert!(script.starts_with("sudo -n sh -c 'mkdir -p /srv/demo/shared"));
+        assert!(script.contains(
+            "systemd-creds encrypt --name=secrets.env - /srv/demo/shared/secrets.env.cred.tmp"
+        ));
+        assert!(script.ends_with("secrets.env.cred'"));
+        assert!(!script.contains("cat >"));
+
+        let plain = upload_script("/srv/demo", SecretsMode::EncryptedCredential, false);
+        assert!(!plain.contains("sudo"));
+        assert_eq!(
+            restore_script("/srv/demo", SecretsMode::EncryptedCredential, true),
+            "sudo -n sh -c 'if [ -f /srv/demo/shared/secrets.env.cred.prev ]; then \
+mv -f /srv/demo/shared/secrets.env.cred.prev /srv/demo/shared/secrets.env.cred; fi'"
         );
     }
 

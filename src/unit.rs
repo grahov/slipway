@@ -2,7 +2,7 @@
 
 use std::fmt::Write;
 
-use crate::config::{Config, SecretsMode, ServiceScope, secrets_path};
+use crate::config::{Config, SecretsMode, ServiceScope, secrets_remote_file};
 
 /// Renders the full unit text for one host's root. The output references
 /// only `{root}/current`, never a concrete release, so the unit changes
@@ -30,10 +30,13 @@ pub fn render(config: &Config, root: &str) -> String {
         let _ = writeln!(unit, "Environment=\"{key}={value}\"");
     }
     if let Some(secrets) = &config.secrets {
-        let path = secrets_path(root);
+        let path = secrets_remote_file(root, secrets.mode);
         let _ = match secrets.mode {
             SecretsMode::EnvFile => writeln!(unit, "EnvironmentFile={path}"),
             SecretsMode::Credential => writeln!(unit, "LoadCredential=secrets.env:{path}"),
+            SecretsMode::EncryptedCredential => {
+                writeln!(unit, "LoadCredentialEncrypted=secrets.env:{path}")
+            }
         };
     }
     for extra in &config.service.unit_extra {
@@ -155,5 +158,15 @@ WantedBy=multi-user.target
         );
         assert!(credential.contains("LoadCredential=secrets.env:/srv/demo/shared/secrets.env\n"));
         assert!(!credential.contains("EnvironmentFile="));
+
+        let encrypted = render(
+            &config(&format!("{base}mode = \"encrypted-credential\"\n")),
+            "/srv/demo",
+        );
+        assert!(
+            encrypted.contains(
+                "LoadCredentialEncrypted=secrets.env:/srv/demo/shared/secrets.env.cred\n"
+            )
+        );
     }
 }
