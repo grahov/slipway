@@ -1,0 +1,22 @@
+[package]
+name = "slipway"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Capistrano-style deploys to plain Linux hosts over ssh: releases, systemd, health checks, rollback"
+license = "MIT"
+readme = "README.md"
+keywords = ["deploy", "systemd", "ssh", "cli", "devops"]
+categories = ["command-line-utilities", "development-tools"]
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+jiff = "0.2"
+owo-colors = "4"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+[profile.release]
+lto = true
+strip = true
