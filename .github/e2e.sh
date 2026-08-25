@@ -106,7 +106,7 @@ EDITOR=./ed.sh "$SLIPWAY" secrets edit >/dev/null
 make_artifact v4
 "$SLIPWAY" deploy || fail "deploy with secrets"
 pid=$(sudo systemctl show "$APP" -p MainPID --value)
-sudo tr '\0' '\n' < "/proc/$pid/environ" | grep -qx 'E2E_MARKER=first' \
+sudo cat "/proc/$pid/environ" | tr '\0' '\n' | grep -qx 'E2E_MARKER=first' \
     || fail "secret not in the service environment"
 
 say "secrets push rotates without a redeploy"
@@ -114,7 +114,7 @@ printf '#!/bin/sh\nprintf "E2E_MARKER=rotated\\n" > "$1"\n' > ed.sh
 EDITOR=./ed.sh "$SLIPWAY" secrets edit >/dev/null
 "$SLIPWAY" secrets push || fail "secrets push"
 pid=$(sudo systemctl show "$APP" -p MainPID --value)
-sudo tr '\0' '\n' < "/proc/$pid/environ" | grep -qx 'E2E_MARKER=rotated' \
+sudo cat "/proc/$pid/environ" | tr '\0' '\n' | grep -qx 'E2E_MARKER=rotated' \
     || fail "rotated secret not in the service environment"
 
 say "encrypted-credential mode decrypts through systemd"
