@@ -6,6 +6,8 @@ rust-version = "1.85"
 description = "Capistrano-style deploys to plain Linux hosts over ssh: releases, systemd, health checks, rollback"
 license = "MIT"
 readme = "README.md"
+repository = "https://github.com/grahov/slipway"
+exclude = [".github/"]
 keywords = ["deploy", "systemd", "ssh", "cli", "devops"]
 categories = ["command-line-utilities", "development-tools"]
 
