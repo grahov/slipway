@@ -18,9 +18,31 @@ pub struct Config {
     pub build: Build,
     #[serde(default)]
     pub remote: Remote,
+    #[serde(default)]
+    pub rollout: Rollout,
     pub service: Service,
     pub healthcheck: Option<Healthcheck>,
     pub secrets: Option<Secrets>,
+}
+
+/// How the fleet is walked during a deploy. Rollback, status, and secrets
+/// push stay sequential regardless.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Rollout {
+    /// Hosts deployed concurrently within one wave.
+    pub parallel: usize,
+    /// Hosts that must fully succeed before the rest of the fleet starts.
+    pub canary: usize,
+}
+
+impl Default for Rollout {
+    fn default() -> Self {
+        Self {
+            parallel: 1,
+            canary: 0,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -158,6 +180,10 @@ artifact = "target/release/myapp"
 # keep_releases = 5          # releases kept on the host after a deploy
 # sudo = true                # prefix systemctl and unit install with sudo -n
 
+# [rollout]
+# canary = 1                 # hosts that must succeed before the rest start
+# parallel = 4               # hosts deployed concurrently within a wave
+
 [service]
 # {current} expands to the `current` symlink, e.g. /srv/myapp/current.
 exec_start = "{current}/myapp"
@@ -248,6 +274,9 @@ impl Config {
         }
         if self.remote.keep_releases == 0 {
             bail!("remote.keep_releases must be at least 1");
+        }
+        if self.rollout.parallel == 0 {
+            bail!("rollout.parallel must be at least 1");
         }
         if self.build.artifact.is_empty() {
             bail!("build.artifact must not be empty");

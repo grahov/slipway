@@ -95,13 +95,78 @@ pub fn deploy(config: &Config, opts: &Opts) -> Result<()> {
     build(config, opts)?;
     let id = release::new_id();
     let secret_text = load_secret_text(config, opts.dry_run)?;
-    for target in targets {
-        let mut runner = Runner::new(&target, opts.dry_run);
-        deploy_host(&mut runner, config, &target, &id, secret_text.as_deref())
-            .with_context(|| format!("deploy of {id} failed on {}", target.addr))?;
+    let parallel = if opts.dry_run {
+        1
+    } else {
+        config.rollout.parallel
+    };
+    let mut rest = targets.as_slice();
+    for size in wave_sizes(targets.len(), config.rollout.canary, parallel) {
+        let (wave, tail) = rest.split_at(size);
+        rest = tail;
+        run_wave(wave, config, &id, secret_text.as_deref(), opts.dry_run)?;
     }
     ui::ok(&format!("deployed {id}"));
     Ok(())
+}
+
+/// Wave sizes for a fleet: the canary hosts first, everything chunked by
+/// `parallel`. The whole canary must succeed before any later wave starts.
+fn wave_sizes(total: usize, canary: usize, parallel: usize) -> Vec<usize> {
+    let parallel = parallel.max(1);
+    let canary = canary.min(total);
+    let mut sizes = Vec::new();
+    for mut part in [canary, total - canary] {
+        while part > 0 {
+            let take = part.min(parallel);
+            sizes.push(take);
+            part -= take;
+        }
+    }
+    sizes
+}
+
+/// One wave: hosts run concurrently and fail independently — each rolls
+/// itself back on a bad health check. The rollout stops between waves on
+/// any failure, so a canary failure leaves the rest of the fleet untouched.
+fn run_wave(
+    wave: &[Target],
+    config: &Config,
+    id: &str,
+    secret_text: Option<&str>,
+    dry: bool,
+) -> Result<()> {
+    if wave.len() == 1 {
+        return deploy_one(&wave[0], config, id, secret_text, dry);
+    }
+    let errors: Vec<String> = thread::scope(|scope| {
+        let handles: Vec<_> = wave
+            .iter()
+            .map(|target| scope.spawn(move || deploy_one(target, config, id, secret_text, dry)))
+            .collect();
+        handles
+            .into_iter()
+            .filter_map(|handle| handle.join().expect("deploy thread panicked").err())
+            .map(|err| format!("{err:#}"))
+            .collect()
+    });
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        bail!(errors.join("\n"))
+    }
+}
+
+fn deploy_one(
+    target: &Target,
+    config: &Config,
+    id: &str,
+    secret_text: Option<&str>,
+    dry: bool,
+) -> Result<()> {
+    let mut runner = Runner::new(target, dry);
+    deploy_host(&mut runner, config, target, id, secret_text)
+        .with_context(|| format!("deploy of {id} failed on {}", target.addr))
 }
 
 /// `slipway secrets push`: rotate secrets without a redeploy. A failed
@@ -553,6 +618,15 @@ mod tests {
         );
         assert!(selected(&config, &opts(Some("app"), Some("db"))).is_err());
         assert!(selected(&config, &opts(None, Some("cache"))).is_err());
+    }
+
+    #[test]
+    fn wave_sizes_chunk_canary_first() {
+        assert_eq!(wave_sizes(5, 0, 1), [1, 1, 1, 1, 1]);
+        assert_eq!(wave_sizes(5, 0, 2), [2, 2, 1]);
+        assert_eq!(wave_sizes(5, 1, 2), [1, 2, 2]);
+        assert_eq!(wave_sizes(5, 3, 2), [2, 1, 2]);
+        assert_eq!(wave_sizes(2, 5, 8), [2]);
     }
 
     #[test]
