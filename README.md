@@ -37,10 +37,10 @@ systemd, it is already a deploy target.
 ## Install
 
 Grab a binary from [releases](https://github.com/grahov/slipway/releases)
-(linux and macOS, x86_64 and aarch64), or build from source:
+(linux and macOS, x86_64 and aarch64), or install from crates.io:
 
 ```
-cargo install --path .
+cargo install slipway
 ```
 
 ## Quick start
@@ -207,7 +207,6 @@ by the service user; `encrypted-credential` removes even that.
 
 - multiple services per config file
 - `slipway diff`: what a deploy would change, before running it
-- crates.io packaging
 
 ## License
 
