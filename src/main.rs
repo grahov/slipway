@@ -40,6 +40,7 @@ fn run() -> Result<()> {
                     dry_run,
                     skip_build,
                     host_filter: common.host,
+                    group_filter: common.group,
                 },
             )
         }
@@ -51,6 +52,7 @@ fn run() -> Result<()> {
                     dry_run: false,
                     skip_build: true,
                     host_filter: common.host,
+                    group_filter: common.group,
                 },
             )
         }
@@ -62,6 +64,7 @@ fn run() -> Result<()> {
                     dry_run: false,
                     skip_build: true,
                     host_filter: common.host,
+                    group_filter: common.group,
                 },
             )
         }
@@ -76,6 +79,7 @@ fn run() -> Result<()> {
                         dry_run,
                         skip_build: true,
                         host_filter: common.host,
+                        group_filter: common.group,
                     },
                 )
             }

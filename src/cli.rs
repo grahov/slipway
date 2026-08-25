@@ -79,4 +79,7 @@ pub struct Common {
     /// Only hosts whose ssh destination contains this substring
     #[arg(long)]
     pub host: Option<String>,
+    /// Only hosts labeled with this group in the config
+    #[arg(long)]
+    pub group: Option<String>,
 }

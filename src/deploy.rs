@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
-use crate::config::Config;
+use crate::config::{Config, Target, secrets_path};
 use crate::release;
 use crate::secrets;
 use crate::ssh::Shell;
@@ -17,6 +17,7 @@ pub struct Opts {
     pub dry_run: bool,
     pub skip_build: bool,
     pub host_filter: Option<String>,
+    pub group_filter: Option<String>,
 }
 
 /// One host's ssh session plus the dry-run switch. In dry mode every call
@@ -30,9 +31,9 @@ struct Runner {
 }
 
 impl Runner {
-    fn new(config: &Config, host: &str, dry: bool) -> Self {
+    fn new(target: &Target, dry: bool) -> Self {
         Self {
-            shell: Shell::new(host, config.remote.sudo),
+            shell: Shell::new(&target.addr, target.sudo),
             dry,
             log: Vec::new(),
         }
@@ -90,15 +91,14 @@ impl Runner {
 }
 
 pub fn deploy(config: &Config, opts: &Opts) -> Result<()> {
-    let hosts = selected(config, opts)?;
+    let targets = selected(config, opts)?;
     build(config, opts)?;
     let id = release::new_id();
-    let unit_text = unit::render(config);
     let secret_text = load_secret_text(config, opts.dry_run)?;
-    for host in hosts {
-        let mut runner = Runner::new(config, &host, opts.dry_run);
-        deploy_host(&mut runner, config, &id, &unit_text, secret_text.as_deref())
-            .with_context(|| format!("deploy of {id} failed on {host}"))?;
+    for target in targets {
+        let mut runner = Runner::new(&target, opts.dry_run);
+        deploy_host(&mut runner, config, &target, &id, secret_text.as_deref())
+            .with_context(|| format!("deploy of {id} failed on {}", target.addr))?;
     }
     ui::ok(&format!("deployed {id}"));
     Ok(())
@@ -110,11 +110,10 @@ pub fn deploy(config: &Config, opts: &Opts) -> Result<()> {
 pub fn secrets_push(config: &Config, opts: &Opts) -> Result<()> {
     secrets::required(config)?;
     let secret_text = load_secret_text(config, opts.dry_run)?;
-    let path = config.secrets_path();
-    for host in selected(config, opts)? {
-        let mut runner = Runner::new(config, &host, opts.dry_run);
-        push_host(&mut runner, config, &path, secret_text.as_deref())
-            .with_context(|| format!("secrets push failed on {host}"))?;
+    for target in selected(config, opts)? {
+        let mut runner = Runner::new(&target, opts.dry_run);
+        push_host(&mut runner, config, &target, secret_text.as_deref())
+            .with_context(|| format!("secrets push failed on {}", target.addr))?;
     }
     ui::ok("secrets pushed");
     Ok(())
@@ -134,35 +133,40 @@ fn load_secret_text(config: &Config, dry: bool) -> Result<Option<String>> {
 }
 
 pub fn rollback(config: &Config, opts: &Opts) -> Result<()> {
-    for host in selected(config, opts)? {
-        let mut runner = Runner::new(config, &host, opts.dry_run);
-        rollback_host(&mut runner, config).with_context(|| format!("rollback failed on {host}"))?;
+    for target in selected(config, opts)? {
+        let mut runner = Runner::new(&target, opts.dry_run);
+        rollback_host(&mut runner, config, &target)
+            .with_context(|| format!("rollback failed on {}", target.addr))?;
     }
     Ok(())
 }
 
 pub fn status(config: &Config, opts: &Opts) -> Result<()> {
-    for host in selected(config, opts)? {
-        let mut runner = Runner::new(config, &host, false);
-        status_host(&mut runner, config).with_context(|| format!("status failed on {host}"))?;
+    for target in selected(config, opts)? {
+        let mut runner = Runner::new(&target, false);
+        status_host(&mut runner, config, &target)
+            .with_context(|| format!("status failed on {}", target.addr))?;
     }
     Ok(())
 }
 
-fn selected(config: &Config, opts: &Opts) -> Result<Vec<String>> {
-    let hosts: Vec<String> = match &opts.host_filter {
-        Some(filter) => config
-            .hosts
-            .iter()
-            .filter(|host| host.contains(filter.as_str()))
-            .cloned()
-            .collect(),
-        None => config.hosts.clone(),
-    };
-    if hosts.is_empty() {
-        bail!("no configured host matches the --host filter");
+fn selected(config: &Config, opts: &Opts) -> Result<Vec<Target>> {
+    let targets: Vec<Target> = config
+        .targets()
+        .into_iter()
+        .filter(|target| match &opts.host_filter {
+            Some(filter) => target.addr.contains(filter.as_str()),
+            None => true,
+        })
+        .filter(|target| match &opts.group_filter {
+            Some(group) => target.group.as_deref() == Some(group.as_str()),
+            None => true,
+        })
+        .collect();
+    if targets.is_empty() {
+        bail!("no configured host matches the --host/--group filters");
     }
-    Ok(hosts)
+    Ok(targets)
 }
 
 fn build(config: &Config, opts: &Opts) -> Result<()> {
@@ -191,47 +195,47 @@ fn build(config: &Config, opts: &Opts) -> Result<()> {
 fn deploy_host(
     runner: &mut Runner,
     config: &Config,
+    target: &Target,
     id: &str,
-    unit_text: &str,
     secret_text: Option<&str>,
 ) -> Result<()> {
     let host = runner.host();
-    let root = config.root();
+    let root = &target.root;
     ui::step(&host, &format!("release {id}"));
     let (parent, name) = artifact_parts(&config.build.artifact)?;
     runner.upload(parent, name, &format!("{root}/releases/{id}"))?;
     if config.secrets.is_some() {
         ui::step(&host, "install secrets");
         runner.feed(
-            &secrets::upload_script(&config.secrets_path()),
+            &secrets::upload_script(&secrets_path(root)),
             secret_text.unwrap_or(""),
         )?;
     }
-    sync_unit(runner, config, unit_text)?;
-    let previous = current_release(runner, &root)?;
+    sync_unit(runner, config, &unit::render(config, root))?;
+    let previous = current_release(runner, root)?;
     ui::step(&host, "flip current and restart");
-    flip(runner, &root, id)?;
+    flip(runner, root, id)?;
     restart(runner, config)?;
     if let Err(err) = check_health(runner, config) {
-        return recover(runner, config, previous, err);
+        return recover(runner, config, target, previous, err);
     }
-    prune(runner, config, &root, id)?;
+    prune(runner, config, root, id)?;
     ui::step(&host, "done");
     Ok(())
 }
 
-fn rollback_host(runner: &mut Runner, config: &Config) -> Result<()> {
+fn rollback_host(runner: &mut Runner, config: &Config, target: &Target) -> Result<()> {
     let host = runner.host();
-    let root = config.root();
+    let root = target.root.clone();
     let current = current_release(runner, &root)?;
     let ids = list_releases(runner, &root)?;
-    let target = current.as_ref().and_then(|cur| {
+    let picked = current.as_ref().and_then(|cur| {
         ids.iter()
             .rev()
             .find(|id| id.as_str() < cur.as_str())
             .cloned()
     });
-    let Some(target) = target else {
+    let Some(picked) = picked else {
         if runner.dry {
             ui::step(&host, "would flip to the release preceding current");
             return Ok(());
@@ -241,20 +245,20 @@ fn rollback_host(runner: &mut Runner, config: &Config) -> Result<()> {
     ui::step(
         &host,
         &format!(
-            "rollback {} -> {target}",
+            "rollback {} -> {picked}",
             current.as_deref().unwrap_or("none")
         ),
     );
-    flip(runner, &root, &target)?;
+    flip(runner, &root, &picked)?;
     restart(runner, config)?;
     check_health(runner, config)?;
     ui::step(&host, "done");
     Ok(())
 }
 
-fn status_host(runner: &mut Runner, config: &Config) -> Result<()> {
+fn status_host(runner: &mut Runner, config: &Config, target: &Target) -> Result<()> {
     let host = runner.host();
-    let root = config.root();
+    let root = target.root.clone();
     let current = current_release(runner, &root)?;
     let active = runner.read(&format!(
         "systemctl is-active {} 2>/dev/null || true",
@@ -384,6 +388,7 @@ fn check_health(runner: &mut Runner, config: &Config) -> Result<()> {
 fn recover(
     runner: &mut Runner,
     config: &Config,
+    target: &Target,
     previous: Option<String>,
     err: anyhow::Error,
 ) -> Result<()> {
@@ -392,9 +397,9 @@ fn recover(
         bail!("{err:#}; no previous release to roll back to");
     };
     ui::fail(&format!("  {host} unhealthy, rolling back to {previous}"));
-    flip(runner, &config.root(), &previous)?;
+    flip(runner, &target.root, &previous)?;
     if config.secrets.is_some() {
-        runner.run(&secrets::restore_script(&config.secrets_path()))?;
+        runner.run(&secrets::restore_script(&secrets_path(&target.root)))?;
     }
     restart(runner, config)?;
     match check_health(runner, config) {
@@ -406,10 +411,11 @@ fn recover(
 fn push_host(
     runner: &mut Runner,
     config: &Config,
-    path: &str,
+    target: &Target,
     secret_text: Option<&str>,
 ) -> Result<()> {
     let host = runner.host();
+    let path = &secrets_path(&target.root);
     ui::step(&host, "install secrets");
     runner.feed(&secrets::upload_script(path), secret_text.unwrap_or(""))?;
     restart(runner, config)?;
@@ -448,12 +454,16 @@ mod tests {
         .unwrap()
     }
 
+    fn first_target(config: &Config) -> Target {
+        config.targets().remove(0)
+    }
+
     #[test]
     fn dry_run_plan_is_stable() {
         let config = test_config();
-        let unit_text = unit::render(&config);
-        let mut runner = Runner::new(&config, "deploy@h1", true);
-        deploy_host(&mut runner, &config, "20260825120000", &unit_text, None).unwrap();
+        let target = first_target(&config);
+        let mut runner = Runner::new(&target, true);
+        deploy_host(&mut runner, &config, &target, "20260825120000", None).unwrap();
         let expected = [
             "ssh deploy@h1 mkdir -p /srv/demo/releases/20260825120000 \
              && tar -xzf - -C /srv/demo/releases/20260825120000",
@@ -476,9 +486,9 @@ mod tests {
     fn dry_run_plan_with_secrets_adds_one_feed_step() {
         let mut config = test_config();
         config.secrets = Some(crate::config::Secrets::default());
-        let unit_text = unit::render(&config);
-        let mut runner = Runner::new(&config, "deploy@h1", true);
-        deploy_host(&mut runner, &config, "20260825120000", &unit_text, None).unwrap();
+        let target = first_target(&config);
+        let mut runner = Runner::new(&target, true);
+        deploy_host(&mut runner, &config, &target, "20260825120000", None).unwrap();
         assert_eq!(runner.log.len(), 10);
         assert_eq!(
             runner.log[1],
@@ -493,9 +503,10 @@ mod tests {
     fn push_plan_uploads_restarts_and_checks() {
         let mut config = test_config();
         config.secrets = Some(crate::config::Secrets::default());
-        let path = config.secrets_path();
-        let mut runner = Runner::new(&config, "deploy@h1", true);
-        push_host(&mut runner, &config, &path, None).unwrap();
+        let target = first_target(&config);
+        let mut runner = Runner::new(&target, true);
+        push_host(&mut runner, &config, &target, None).unwrap();
+        let path = secrets_path(&target.root);
         assert_eq!(
             runner.log,
             [
@@ -507,21 +518,41 @@ mod tests {
     }
 
     #[test]
-    fn host_filter_selects_substrings_and_rejects_misses() {
-        let mut config = test_config();
-        config.hosts = vec![
-            "deploy@app1".into(),
-            "deploy@app2".into(),
-            "deploy@db1".into(),
-        ];
-        let opts = |filter: Option<&str>| Opts {
+    fn filters_select_by_addr_substring_and_group() {
+        let config: Config = toml::from_str(
+            r#"
+            app = "demo"
+            hosts = [
+                { addr = "deploy@app1", group = "web" },
+                { addr = "deploy@app2", group = "web" },
+                { addr = "deploy@db1", group = "db" },
+            ]
+            [build]
+            artifact = "out/demo"
+            [service]
+            exec_start = "{current}/demo"
+        "#,
+        )
+        .unwrap();
+        let opts = |host: Option<&str>, group: Option<&str>| Opts {
             dry_run: true,
             skip_build: true,
-            host_filter: filter.map(str::to_string),
+            host_filter: host.map(str::to_string),
+            group_filter: group.map(str::to_string),
         };
-        assert_eq!(selected(&config, &opts(Some("app"))).unwrap().len(), 2);
-        assert_eq!(selected(&config, &opts(None)).unwrap().len(), 3);
-        assert!(selected(&config, &opts(Some("web"))).is_err());
+        assert_eq!(
+            selected(&config, &opts(Some("app"), None)).unwrap().len(),
+            2
+        );
+        assert_eq!(selected(&config, &opts(None, Some("db"))).unwrap().len(), 1);
+        assert_eq!(
+            selected(&config, &opts(Some("app"), Some("web")))
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(selected(&config, &opts(Some("app"), Some("db"))).is_err());
+        assert!(selected(&config, &opts(None, Some("cache"))).is_err());
     }
 
     #[test]

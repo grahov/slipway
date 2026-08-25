@@ -2,13 +2,13 @@
 
 use std::fmt::Write;
 
-use crate::config::{Config, SecretsMode};
+use crate::config::{Config, SecretsMode, secrets_path};
 
-/// Renders the full unit text. The output references only `{root}/current`,
-/// never a concrete release, so the unit changes when the config changes
-/// and stays byte-identical across routine deploys.
-pub fn render(config: &Config) -> String {
-    let root = config.root();
+/// Renders the full unit text for one host's root. The output references
+/// only `{root}/current`, never a concrete release, so the unit changes
+/// when the config changes and stays byte-identical across routine
+/// deploys.
+pub fn render(config: &Config, root: &str) -> String {
     let exec_start = config
         .service
         .exec_start
@@ -30,7 +30,7 @@ pub fn render(config: &Config) -> String {
         let _ = writeln!(unit, "Environment=\"{key}={value}\"");
     }
     if let Some(secrets) = &config.secrets {
-        let path = config.secrets_path();
+        let path = secrets_path(root);
         let _ = match secrets.mode {
             SecretsMode::EnvFile => writeln!(unit, "EnvironmentFile={path}"),
             SecretsMode::Credential => writeln!(unit, "LoadCredential=secrets.env:{path}"),
@@ -92,7 +92,7 @@ RestartSec=2
 [Install]
 WantedBy=multi-user.target
 ";
-        assert_eq!(render(&config), expected);
+        assert_eq!(render(&config, "/opt/demo"), expected);
     }
 
     #[test]
@@ -107,7 +107,7 @@ WantedBy=multi-user.target
             exec_start = "{current}/demo"
         "#,
         );
-        let rendered = render(&config);
+        let rendered = render(&config, "/srv/demo");
         assert!(rendered.contains("ExecStart=/srv/demo/current/demo\n"));
         assert!(!rendered.contains("User="));
         assert!(!rendered.contains("Environment="));
@@ -124,10 +124,13 @@ WantedBy=multi-user.target
             exec_start = "{current}/demo"
             [secrets]
         "#;
-        let env_file = render(&config(base));
+        let env_file = render(&config(base), "/srv/demo");
         assert!(env_file.contains("EnvironmentFile=/srv/demo/shared/secrets.env\n"));
 
-        let credential = render(&config(&format!("{base}mode = \"credential\"\n")));
+        let credential = render(
+            &config(&format!("{base}mode = \"credential\"\n")),
+            "/srv/demo",
+        );
         assert!(credential.contains("LoadCredential=secrets.env:/srv/demo/shared/secrets.env\n"));
         assert!(!credential.contains("EnvironmentFile="));
     }

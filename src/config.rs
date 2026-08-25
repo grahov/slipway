@@ -14,7 +14,7 @@ use serde::Deserialize;
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub app: String,
-    pub hosts: Vec<String>,
+    pub hosts: Vec<HostEntry>,
     pub build: Build,
     #[serde(default)]
     pub remote: Remote,
@@ -28,6 +28,33 @@ pub struct Config {
 pub struct Build {
     pub command: Option<String>,
     pub artifact: String,
+}
+
+/// A host is either a bare ssh destination or a table refining it.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum HostEntry {
+    Addr(String),
+    Table(HostTable),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostTable {
+    pub addr: String,
+    pub group: Option<String>,
+    pub sudo: Option<bool>,
+    pub root: Option<String>,
+}
+
+/// One host with every default resolved; the only host shape the
+/// pipelines ever see.
+#[derive(Debug, Clone)]
+pub struct Target {
+    pub addr: String,
+    pub group: Option<String>,
+    pub sudo: bool,
+    pub root: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -174,10 +201,25 @@ impl Config {
         format!("{}.service", self.app)
     }
 
-    /// The one remote location for decrypted secrets; both the deploy
-    /// pipeline and the unit renderer must agree on it.
-    pub fn secrets_path(&self) -> String {
-        format!("{}/shared/secrets.env", self.root())
+    /// Hosts with `remote.*` defaults applied and table overrides on top.
+    pub fn targets(&self) -> Vec<Target> {
+        self.hosts
+            .iter()
+            .map(|entry| match entry {
+                HostEntry::Addr(addr) => Target {
+                    addr: addr.clone(),
+                    group: None,
+                    sudo: self.remote.sudo,
+                    root: self.root(),
+                },
+                HostEntry::Table(table) => Target {
+                    addr: table.addr.clone(),
+                    group: table.group.clone(),
+                    sudo: table.sudo.unwrap_or(self.remote.sudo),
+                    root: table.root.clone().unwrap_or_else(|| self.root()),
+                },
+            })
+            .collect()
     }
 
     /// Rejects values that could break out of the remote command lines and
@@ -192,14 +234,17 @@ impl Config {
         if self.hosts.is_empty() {
             bail!("hosts must list at least one ssh destination");
         }
-        for host in &self.hosts {
-            if host.is_empty() || host.starts_with('-') || host.chars().any(char::is_whitespace) {
-                bail!("host {host:?} is not a valid ssh destination");
+        for target in self.targets() {
+            let addr = &target.addr;
+            if addr.is_empty() || addr.starts_with('-') || addr.chars().any(char::is_whitespace) {
+                bail!("host {addr:?} is not a valid ssh destination");
             }
-        }
-        let root = self.root();
-        if !root.starts_with('/') || !root.chars().all(is_path_char) {
-            bail!("remote.root must be absolute and use only [A-Za-z0-9/._-], got {root:?}");
+            let root = &target.root;
+            if !root.starts_with('/') || !root.chars().all(is_path_char) {
+                bail!(
+                    "root for {addr} must be absolute and use only [A-Za-z0-9/._-], got {root:?}"
+                );
+            }
         }
         if self.remote.keep_releases == 0 {
             bail!("remote.keep_releases must be at least 1");
@@ -256,6 +301,12 @@ impl Config {
         }
         lines
     }
+}
+
+/// The one remote location for decrypted secrets under a host's root;
+/// the deploy pipeline and the unit renderer must agree on it.
+pub fn secrets_path(root: &str) -> String {
+    format!("{root}/shared/secrets.env")
 }
 
 fn is_name_char(c: char) -> bool {
@@ -325,10 +376,39 @@ mod tests {
     }
 
     #[test]
+    fn host_tables_resolve_defaults_and_overrides() {
+        let text = r#"
+            app = "demo"
+            hosts = [
+                "deploy@plain",
+                { addr = "deploy@web1", group = "web" },
+                { addr = "root@db1", group = "db", sudo = false, root = "/opt/demo" },
+            ]
+            [build]
+            artifact = "out/demo"
+            [service]
+            exec_start = "{current}/demo"
+        "#;
+        let config = parse(text).unwrap();
+        let targets = config.targets();
+        assert_eq!(targets.len(), 3);
+        assert!(targets[0].sudo && targets[0].group.is_none());
+        assert_eq!(targets[0].root, "/srv/demo");
+        assert_eq!(targets[1].group.as_deref(), Some("web"));
+        assert!(!targets[2].sudo);
+        assert_eq!(targets[2].root, "/opt/demo");
+
+        let bad = text.replace("root = \"/opt/demo\"", "root = \"opt/demo\"");
+        assert!(parse(&bad).is_err());
+        let unknown = text.replace("group = \"db\", ", "grp = \"db\", ");
+        assert!(parse(&unknown).is_err());
+    }
+
+    #[test]
     fn secrets_table_gets_defaults_and_rejects_bad_values() {
         let with_secrets = format!("{MINIMAL}\n[secrets]\n");
         let config = parse(&with_secrets).unwrap();
-        assert_eq!(config.secrets_path(), "/srv/demo/shared/secrets.env");
+        assert_eq!(secrets_path(&config.root()), "/srv/demo/shared/secrets.env");
         let secrets = config.secrets.unwrap();
         assert_eq!(secrets.file, "secrets.env.age");
         assert_eq!(secrets.mode, SecretsMode::EnvFile);
