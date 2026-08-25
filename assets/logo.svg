@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 500 140" width="500" height="140" role="img" aria-label="slipway">
+  <title>slipway</title>
+  <style>
+    text {
+      font: 700 72px ui-monospace, "SF Mono", "Menlo", "Consolas", "Liberation Mono", monospace;
+      fill: #1f2328;
+    }
+    @media (prefers-color-scheme: dark) {
+      text { fill: #e6edf3; }
+    }
+  </style>
+  <g fill="none" stroke-width="10" stroke-linecap="round">
+    <path stroke="#10b981" d="M26 36 L98 84"/>
+    <path stroke="#06b6d4" d="M20 106 c10 -10 22 -10 32 0 c10 10 22 10 32 0 c10 -10 22 -10 32 0"/>
+  </g>
+  <rect x="50" y="37.4" width="24" height="14" rx="4" fill="#d946ef" transform="rotate(33.7 62 44.4)"/>
+  <text x="150" y="94" textLength="302" lengthAdjust="spacingAndGlyphs">slipway</text>
+  <rect x="466" y="40" width="13" height="56" rx="4" fill="#10b981" opacity="0.9"/>
+</svg>
