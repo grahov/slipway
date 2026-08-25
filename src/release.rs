@@ -1,7 +1,9 @@
 //! Release ids and retention.
 //!
-//! An id is the UTC deploy time as `%Y%m%d%H%M%S`, so lexicographic order
-//! is chronological order and ids stay shell-safe by construction.
+//! An id is the UTC deploy time as `%Y%m%d%H%M%S` plus three millisecond
+//! digits, so lexicographic order is chronological order, ids stay
+//! shell-safe by construction, and two deploys within the same second
+//! cannot land in the same release directory.
 
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
@@ -11,15 +13,16 @@ pub fn new_id() -> String {
 }
 
 fn id_at(at: Timestamp) -> String {
-    at.to_zoned(TimeZone::UTC)
-        .strftime("%Y%m%d%H%M%S")
-        .to_string()
+    let seconds = at.to_zoned(TimeZone::UTC).strftime("%Y%m%d%H%M%S");
+    format!("{seconds}{:03}", at.as_millisecond().rem_euclid(1000))
 }
 
 /// True for names slipway itself created. Pruning consults this before
 /// deleting anything, so foreign files under releases/ are never touched.
+/// 14-digit names are the pre-0.4 second-precision form; they still sort
+/// correctly next to the current 17-digit ids.
 pub fn is_id(name: &str) -> bool {
-    name.len() == 14 && name.bytes().all(|b| b.is_ascii_digit())
+    matches!(name.len(), 14 | 17) && name.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// Oldest releases beyond `keep`, never the current one, oldest first.
@@ -43,10 +46,19 @@ mod tests {
     }
 
     #[test]
-    fn id_is_utc_seconds() {
-        let at: Timestamp = "2026-08-25T13:15:00Z".parse().unwrap();
-        assert_eq!(id_at(at), "20260825131500");
+    fn id_is_utc_milliseconds() {
+        let at: Timestamp = "2026-08-25T13:15:00.123Z".parse().unwrap();
+        assert_eq!(id_at(at), "20260825131500123");
         assert!(is_id(&new_id()));
+    }
+
+    #[test]
+    fn old_second_precision_ids_are_still_ours() {
+        assert!(is_id("20260825131500"));
+        assert!(is_id("20260825131500123"));
+        assert!(!is_id("2026082513150012"));
+        let mixed = names(&["20260825131500", "20260825131500123"]);
+        assert_eq!(prune_candidates(&mixed, 1, None), names(&["20260825131500"]));
     }
 
     #[test]

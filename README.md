@@ -118,9 +118,9 @@ Each host ends up with the classic capistrano layout:
 ```
 /srv/myapp/
   releases/
-    20260825120301/
-    20260825131500/
-  current -> releases/20260825131500
+    20260825120301000/
+    20260825131500247/
+  current -> releases/20260825131500247
 ```
 
 1. The build command runs locally, once.
