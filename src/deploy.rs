@@ -323,6 +323,7 @@ fn deploy_host(
     let host = runner.host();
     let root = &target.root;
     ui::step(&host, &format!("release {id}"));
+    runner.run(&ensure_root_script(config, target))?;
     let (parent, name) = artifact_parts(&config.build.artifact)?;
     runner.upload(parent, name, &format!("{root}/releases/{id}"))?;
     if let Some(sec) = &config.secrets {
@@ -405,6 +406,18 @@ fn status_host(runner: &mut Runner, config: &Config, target: &Target) -> Result<
     ));
     ui::note(&format!("  releases: {}", recent.join(" ")));
     Ok(())
+}
+
+/// Makes the first deploy to a fresh host work: parents like `/srv` are
+/// root-owned, so with sudo the root is created once and handed to the
+/// deploy user. Never touches ownership of an existing root.
+fn ensure_root_script(config: &Config, target: &Target) -> String {
+    let root = &target.root;
+    if config.service.scope == ServiceScope::System && target.sudo {
+        format!("test -d {root} || sudo -n install -d -o \"$(id -un)\" -g \"$(id -gn)\" {root}")
+    } else {
+        format!("mkdir -p {root}")
+    }
 }
 
 fn artifact_parts(artifact: &str) -> Result<(&Path, &str)> {
@@ -619,6 +632,8 @@ mod tests {
         let mut runner = Runner::new(&target, true);
         deploy_host(&mut runner, &config, &target, "20260825120000", None).unwrap();
         let expected = [
+            "ssh deploy@h1 test -d /srv/demo || sudo -n install -d -o \"$(id -un)\" \
+             -g \"$(id -gn)\" /srv/demo",
             "ssh deploy@h1 mkdir -p /srv/demo/releases/20260825120000 \
              && tar -xzf - -C /srv/demo/releases/20260825120000",
             "ssh deploy@h1 cat /etc/systemd/system/demo.service 2>/dev/null || true",
@@ -643,9 +658,9 @@ mod tests {
         let target = first_target(&config);
         let mut runner = Runner::new(&target, true);
         deploy_host(&mut runner, &config, &target, "20260825120000", None).unwrap();
-        assert_eq!(runner.log.len(), 10);
+        assert_eq!(runner.log.len(), 11);
         assert_eq!(
-            runner.log[1],
+            runner.log[2],
             format!(
                 "ssh deploy@h1 {}",
                 secrets::upload_script("/srv/demo", crate::config::SecretsMode::EnvFile, true)
